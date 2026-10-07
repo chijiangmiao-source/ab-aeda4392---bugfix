@@ -137,6 +137,7 @@
         <div class="pillrow">
           <span class="scope-chip" id="errPos"></span>
           <span class="scope-chip ev" id="errEv"></span>
+          <span class="scope-chip" id="errBudget"></span>
         </div>
       </div>
     </div>
@@ -196,6 +197,7 @@ function kindLabel(k) {
     "repetition-mismatch": "重复变量长度不一致",
     "unbound-literal": "未绑定 literal",
     "recursion-limit": "宏递归超限",
+    "expansion-budget": "展开资源预算超限（受控中止）",
     "incomplete-syntax": "语法不完整/不合法",
     "bad-request": "请求不合法",
   })[k] || k;
@@ -232,6 +234,7 @@ function showClientError(msg) {
   $("errSnippet").textContent = "";
   $("errPos").textContent = "";
   $("errEv").textContent = "";
+  $("errBudget").textContent = "";
 }
 
 function render(data) {
@@ -241,21 +244,37 @@ function render(data) {
     $("errKind").textContent = kindLabel(e.kind);
     $("errMsg").textContent = e.message || "";
     $("errSnippet").textContent = e.snippet || "";
-    $("errPos").textContent = e.line ? `首个相关源片段：第 ${e.line} 行 第 ${e.column} 列` : "";
+    $("errPos").textContent = e.line ? `原始调用位置：第 ${e.line} 行 第 ${e.column} 列` : "";
     $("errEv").textContent = e.evidence ? `稳定证据 ${e.evidence}` : "";
+    if (e.budget && e.limit) {
+      const used = e.used != null ? e.used : "—";
+      const label = e.budget === "output-chars"
+        ? `累计输出预算：${used} / ${e.limit} 字符`
+        : `累计展开预算：${used} / ${e.limit} 次`;
+      $("errBudget").textContent = label;
+    } else {
+      $("errBudget").textContent = "";
+    }
     if (e.span) {
       $("errSnippet").style.cursor = "pointer";
       $("errSnippet").onclick = () => selectSpan(e.span);
     }
     $("verdict").innerHTML =
-      '<span class="badge bad">不通过</span> 已定位首个相关源片段并给出稳定证据，旧结论已清除。';
+      '<span class="badge bad">不通过</span> 已在累计资源预算耗尽前受控停止，' +
+      '定位原始调用位置并给出稳定证据；未保留部分成功结论或逐步记录。';
     if (e.span) selectSpan(e.span);
     return;
   }
 
+  const usedExp = data.expansions != null ? data.expansions : data.steps.length;
+  const b = data.budget || {};
+  const budgetHint = (b.maxExpansions != null)
+    ? `（累计展开 ${usedExp}/${b.maxExpansions} 次 · 输出 ${data.outputChars || 0}/${b.maxOutputChars} 字符）`
+    : "";
   $("verdict").innerHTML =
     '<span class="badge ok">通过</span> 展开完成，共识别 ' + data.macroCount +
-    ' 个宏、记录 ' + data.steps.length + ' 次宏调用展开。';
+    ' 个宏、记录 ' + data.steps.length + ' 次宏调用展开。' +
+    '<span class="hint"> ' + budgetHint + '</span>';
 
   $("normCard").hidden = false;
   $("norm").textContent = data.normalized;

@@ -21,6 +21,7 @@ recursion-limit failure) cannot contaminate a later module.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from hashlib import sha1
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -29,7 +30,15 @@ from .syntax import Cell, Form, GLOBAL_SCOPE, Sym, SyntaxError_, get_span
 
 MAX_MACROS = 12
 MAX_RULES = 8
+# Depth of a single nested expansion path; protects against infinite recursion
+# but says nothing about total work, so cumulative budgets sit below it.
 EXPANSION_LIMIT = 64
+# Cumulative resource budgets *per review*: a duplicating template only 16
+# levels deep otherwise performs 2**16-1 = 65,535 expansions and renders
+# 800k+ characters while never approaching the depth limit.  Both are
+# configurable so deployments can trade headroom against response size.
+MAX_EXPANSIONS = int(os.environ.get("MACRO_REVIEW_MAX_EXPANSIONS", "2000"))
+MAX_OUTPUT_CHARS = int(os.environ.get("MACRO_REVIEW_MAX_OUTPUT_CHARS", "200000"))
 
 CORE_FORMS = {"lambda", "let", "quote", "quasiquote", "define-syntax", "syntax-rules",
               "if", "cond", "begin", "and", "or", "else", "=>"}
@@ -48,12 +57,13 @@ def ident(sym: Sym) -> Identity:
 
 class MacroError(Exception):
     def __init__(self, kind: str, message: str, span: Optional[Tuple[int, int]] = None,
-                 evidence: Optional[str] = None):
+                 evidence: Optional[str] = None, extra: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.kind = kind
         self.message = message
         self.span = span
         self.evidence = evidence or _evidence(kind, message, span)
+        self.extra = extra
 
 
 def _evidence(kind: str, message: str, span: Any) -> str:
@@ -93,6 +103,70 @@ def remove_scope(form: Form, scope: int) -> Form:
     if isinstance(form, Cell):
         return Cell([remove_scope(x, scope) for x in form], span=form.span)
     return form
+
+
+# --------------------------------------------------------------------------- #
+# Cumulative resource budget
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Budget:
+    """Per-review cumulative limits (work + produced output size).
+
+    Unlike the single-path depth limit these bound the *total* expansion tree,
+    which is what a bounded-nesting duplicating template actually exhausts.
+    ``None`` resolves to the module-level (env-configurable) defaults at
+    construction time.
+    """
+
+    max_expansions: Optional[int] = None
+    max_output_chars: Optional[int] = None
+    expansions: int = 0
+    output_chars: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_expansions is None:
+            self.max_expansions = MAX_EXPANSIONS
+        if self.max_output_chars is None:
+            self.max_output_chars = MAX_OUTPUT_CHARS
+
+    def charge_expansion(self, span: Any) -> None:
+        self.expansions += 1
+        if self.expansions > self.max_expansions:
+            raise MacroError(
+                "expansion-budget",
+                f"累计宏展开次数达到预算上限 {self.max_expansions}："
+                "复制型模板嵌套会令展开规模指数增长，已在预算耗尽前停止；"
+                "请拆分模块或减小嵌套规模",
+                span,
+                extra={"budget": "expansions", "limit": self.max_expansions,
+                       "used": self.expansions})
+
+    def charge_output(self, chars: int, span: Any) -> None:
+        self.output_chars += max(0, chars)
+        if self.output_chars > self.max_output_chars:
+            raise MacroError(
+                "expansion-budget",
+                f"累计展开输出规模达到预算上限 {self.max_output_chars} 字符："
+                "复制型模板嵌套会令规范化结果指数增长，已在预算耗尽前停止；"
+                "请拆分模块或减小嵌套规模",
+                span,
+                extra={"budget": "output-chars", "limit": self.max_output_chars,
+                       "used": self.output_chars})
+
+
+def _render_size(f: Form) -> int:
+    """Cheap upper estimate of a form's rendered length, used for the output
+    budget *before* building any per-step evidence strings."""
+    if isinstance(f, Sym):
+        return len(f.name) + 1
+    if isinstance(f, Cell):
+        return 2 + sum(_render_size(x) for x in f)
+    if isinstance(f, bool):
+        return 2
+    if isinstance(f, str):
+        return len(f) + 2
+    return len(str(f))
 
 
 # --------------------------------------------------------------------------- #
@@ -416,6 +490,8 @@ class ReviewResult:
     identities: List[Dict[str, Any]] = field(default_factory=list)
     hygiene_checks: List[Dict[str, Any]] = field(default_factory=list)
     macro_count: int = 0
+    expansions: int = 0
+    output_chars: int = 0
 
 
 def locate(src: str, span: Optional[Tuple[int, int]]) -> Tuple[int, int, str]:
@@ -433,20 +509,26 @@ def locate(src: str, span: Optional[Tuple[int, int]]) -> Tuple[int, int, str]:
     return line, col, f"{text}\n{caret}"
 
 
-def _error_payload(kind: str, message: str, span: Any, evidence: str, src: str) -> Dict[str, Any]:
+def _error_payload(kind: str, message: str, span: Any, evidence: str, src: str,
+                   extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     line, col, snippet = locate(src, span)
-    return {"kind": kind, "message": message, "evidence": evidence,
-            "line": line, "column": col, "snippet": snippet,
-            "span": list(span) if span else None}
+    payload = {"kind": kind, "message": message, "evidence": evidence,
+               "line": line, "column": col, "snippet": snippet,
+               "span": list(span) if span else None}
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 # --------------------------------------------------------------------------- #
 # Review driver
 # --------------------------------------------------------------------------- #
 
-def review(src: str) -> ReviewResult:
+def review(src: str, max_expansions: Optional[int] = None,
+           max_output_chars: Optional[int] = None) -> ReviewResult:
     from .syntax import parse_module
     res = ReviewResult(ok=False)
+    budget = Budget(max_expansions=max_expansions, max_output_chars=max_output_chars)
     try:
         forms = parse_module(src)
         macros: Dict[str, Macro] = {}
@@ -462,17 +544,27 @@ def review(src: str) -> ReviewResult:
 
         env: Env = []
         step_counter = [0]
-        expanded = [_expand(f, env, 1, macros, scopes, res, step_counter, src)
+        expanded = [_expand(f, env, 1, macros, scopes, res, step_counter, src, budget)
                     for f in bodies]
 
         norm, identities, checks = _annotate(expanded, scopes.intro_scopes, src)
         res.normalized = norm
         res.identities = identities
         res.hygiene_checks = checks
+        res.expansions = budget.expansions
+        res.output_chars = budget.output_chars
         res.ok = True
         return res
     except MacroError as e:
-        res.error = _error_payload(e.kind, e.message, e.span, e.evidence, src)
+        # Controlled failure: never retain partial conclusions or the
+        # (potentially large) step evidence accumulated so far.
+        res.steps = []
+        res.normalized = ""
+        res.identities = []
+        res.hygiene_checks = []
+        res.expansions = budget.expansions
+        res.output_chars = budget.output_chars
+        res.error = _error_payload(e.kind, e.message, e.span, e.evidence, src, e.extra)
         return res
     except SyntaxError_ as e:
         ev = _evidence("incomplete-syntax", e.message, e.span)
@@ -560,7 +652,8 @@ def _compile_macro(f: Cell, macros: Dict[str, Macro], scopes: ScopeSupply) -> No
 
 def _expand(form: Form, env: Env, depth: int, macros: Dict[str, Macro],
             scopes: ScopeSupply, res: ReviewResult, step_counter: List[int],
-            src: str, root_span: Optional[Tuple[int, int]] = None) -> Form:
+            src: str, budget: Budget,
+            root_span: Optional[Tuple[int, int]] = None) -> Form:
     if not isinstance(form, Cell) or not form:
         return form
     head = form[0]
@@ -568,14 +661,17 @@ def _expand(form: Form, env: Env, depth: int, macros: Dict[str, Macro],
         if head.name in ("quote", "quasiquote"):
             return form
         if head.name == "lambda" and resolve_binding(head, env) == ("global", "lambda"):
-            return _expand_lambda(form, env, depth, macros, scopes, res, step_counter, src)
+            return _expand_lambda(form, env, depth, macros, scopes, res, step_counter,
+                                  src, budget)
         if head.name == "let" and resolve_binding(head, env) == ("global", "let"):
-            return _expand_let(form, env, depth, macros, scopes, res, step_counter, src)
+            return _expand_let(form, env, depth, macros, scopes, res, step_counter,
+                               src, budget)
         rb = resolve_binding(head, env)
         if rb[0] == "global" and rb[1] in macros:
-            return _expand_macro(form, env, depth, macros, scopes, res, step_counter, src,
-                                 root_span)
-    return Cell([_expand(x, env, depth, macros, scopes, res, step_counter, src, root_span)
+            return _expand_macro(form, env, depth, macros, scopes, res, step_counter,
+                                 src, budget, root_span)
+    return Cell([_expand(x, env, depth, macros, scopes, res, step_counter, src,
+                         budget, root_span)
                  for x in form], span=form.span)
 
 
@@ -591,7 +687,7 @@ def _check_params(params: Form) -> List[Sym]:
 
 
 def _expand_lambda(form: Cell, env: Env, depth, macros, scopes, res, step_counter, src,
-                   root_span=None):
+                   budget, root_span=None):
     if len(form) < 3:
         raise MacroError("incomplete-syntax",
                          "lambda 形式应为 (lambda (<参数>...) <主体>...)", form.span)
@@ -602,14 +698,15 @@ def _expand_lambda(form: Cell, env: Env, depth, macros, scopes, res, step_counte
         raise MacroError("incomplete-syntax", "lambda 参数名重复", form[1].span)
     new_env = env + [(p.name, ps.scopes, object()) for p, ps in zip(params, new_params)]
     bodies = [add_scope(b, scope) for b in form[2:]]
-    bodies = [_expand(b, new_env, depth, macros, scopes, res, step_counter, src, root_span)
+    bodies = [_expand(b, new_env, depth, macros, scopes, res, step_counter, src,
+                      budget, root_span)
               for b in bodies]
     return Cell([Sym("lambda", form[0].scopes, form[0].span),
                  Cell(new_params, span=form[1].span)] + bodies, span=form.span)
 
 
 def _expand_let(form: Cell, env: Env, depth, macros, scopes, res, step_counter, src,
-                root_span=None):
+                budget, root_span=None):
     if len(form) < 3 or not isinstance(form[1], Cell):
         raise MacroError("incomplete-syntax",
                          "let 形式应为 (let ((<名称> <表达式>)...) <主体>...)", form.span)
@@ -622,7 +719,7 @@ def _expand_let(form: Cell, env: Env, depth, macros, scopes, res, step_counter, 
                              "let 绑定必须是 (<名称> <表达式>)", get_span(pair))
         binders.append(pair[0])
         ival = _expand(pair[1], env, depth, macros, scopes, res, step_counter, src,
-                       root_span)
+                       budget, root_span)
         new_pairs.append(Cell([pair[0], ival], span=pair.span))
     scope = scopes.fresh()
     new_binders = [Sym(b.name, b.scopes | {scope}, b.span) for b in binders]
@@ -631,7 +728,8 @@ def _expand_let(form: Cell, env: Env, depth, macros, scopes, res, step_counter, 
     new_env = env + [(b.name, bs.scopes, object()) for b, bs in zip(binders, new_binders)]
     final_pairs = [Cell([bs, p[1]], span=p.span) for bs, p in zip(new_binders, new_pairs)]
     bodies = [add_scope(b, scope) for b in form[2:]]
-    bodies = [_expand(b, new_env, depth, macros, scopes, res, step_counter, src, root_span)
+    bodies = [_expand(b, new_env, depth, macros, scopes, res, step_counter, src,
+                      budget, root_span)
               for b in bodies]
     return Cell([Sym("let", form[0].scopes, form[0].span),
                  Cell(final_pairs, span=bind_cell.span)] + bodies, span=form.span)
@@ -639,7 +737,7 @@ def _expand_let(form: Cell, env: Env, depth, macros, scopes, res, step_counter, 
 
 def _expand_macro(form: Cell, env: Env, depth, macros: Dict[str, Macro],
                   scopes: ScopeSupply, res: ReviewResult, step_counter, src: str,
-                  root_span: Optional[Tuple[int, int]] = None) -> Form:
+                  budget: Budget, root_span: Optional[Tuple[int, int]] = None) -> Form:
     root = root_span or form.span
     if depth > EXPANSION_LIMIT:
         raise MacroError("recursion-limit",
@@ -667,6 +765,13 @@ def _expand_macro(form: Cell, env: Env, depth, macros: Dict[str, Macro],
     if not isinstance(output, Cell):
         output = Cell([output])
 
+    # Cumulative budgets, enforced before any per-step evidence is rendered,
+    # so a runaway review aborts while its step list is still small instead of
+    # constructing tens of thousands of step records.  Errors carry the
+    # *original* call span (root), not the template-generated inner use.
+    budget.charge_expansion(root)
+    budget.charge_output(_render_size(output), root)
+
     step_counter[0] += 1
     line, col, _ = locate(src, form.span)
     after_text, origins = _render_origin(output, macro.intro)
@@ -688,7 +793,8 @@ def _expand_macro(form: Cell, env: Env, depth, macros: Dict[str, Macro],
         after=after_text,
         origins=origins,
     ))
-    return _expand(output, env, depth + 1, macros, scopes, res, step_counter, src, root)
+    return _expand(output, env, depth + 1, macros, scopes, res, step_counter, src,
+                   budget, root)
 
 
 # --------------------------------------------------------------------------- #

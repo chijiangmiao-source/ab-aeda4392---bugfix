@@ -171,6 +171,48 @@ def smoke(base: str) -> bool:
                      "unbound-literal")
     check("未绑定 literal 在定义处报错", d["error"]["kind"] == "unbound-literal")
 
+    # --- cumulative resource budget: one macro, one duplicating rule, 16
+    # nested levels.  Depth stays well under 64 but the expansion tree would
+    # otherwise be 65,535 steps / ~850k chars.  The review must stop in a
+    # controlled way and never return a partial success.
+    dup_call = "1"
+    for _ in range(16):
+        dup_call = f"(dup {dup_call})"
+    dup_module = (
+        "(define-syntax dup (syntax-rules () ((dup e) (list e e))))\n"
+        + dup_call + "\n")
+    _, b = http("POST", f"{base}/api/review", {"source": dup_module})
+    d = json.loads(b)
+    err = d.get("error") or {}
+    check("16 层复制型宏受控失败（非成功结论）",
+          (not d["ok"] and err.get("kind") == "expansion-budget"),
+          err.get("kind", "ok"))
+    check("预算失败定位原始调用处（第 2 行第 1 列）",
+          err.get("line") == 2 and err.get("column") == 1
+          and "(dup (dup" in err.get("snippet", ""),
+          f"{err.get('line')}:{err.get('column')}")
+    check("预算失败给出稳定证据与预算明细",
+          err.get("evidence", "").startswith("EV-")
+          and err.get("budget") == "expansions"
+          and isinstance(err.get("limit"), int) and isinstance(err.get("used"), int),
+          err.get("evidence", ""))
+    check("预算失败不返回步骤记录/规范化结果等部分结论",
+          d.get("steps") == [] and d.get("normalized") == ""
+          and d.get("identities") == [] and d.get("hygieneChecks") == [])
+    check("预算失败在异常规模前停止（步骤远少于 65,535）",
+          (d.get("expansions", 0) or 0) <= 5000 and
+          (d.get("outputChars", 0) or 0) < 100_000,
+          f"expansions={d.get('expansions')} outputChars={d.get('outputChars')}")
+
+    # normal nested macros must still complete
+    _, b = http("POST", f"{base}/api/review", {"source": """
+    (define-syntax nest (syntax-rules () ((nest e) (list e e))))
+    (nest (nest (nest 1)))
+    """})
+    d = json.loads(b)
+    check("正常嵌套宏仍可完成审查", d["ok"] and len(d.get("steps", [])) == 7,
+          f"{len(d.get('steps', []))} 步")
+
     d = expect_error(
         "(define-syntax loop (syntax-rules () ((loop) (loop))))\n(loop)",
         "recursion-limit")
@@ -178,6 +220,10 @@ def smoke(base: str) -> bool:
 
     d2 = expect_error("(define-syntax z (syntax-rules () ((z) 1)))\n(z)", "ok")
     check("递归超限后后续合法模块仍可复核（状态隔离）", d2["ok"] and d2["normalized"])
+
+    d3 = expect_error("(define-syntax z (syntax-rules () ((z) 1)))\n(z)", "ok")
+    check("预算失败后后续合法模块仍可复核（状态隔离）",
+          d3["ok"] and "1" in d3["normalized"])
 
     d = expect_error("(define-syntax x (syntax-rules () ((x a) a))\n(x 1)",
                      "incomplete-syntax")

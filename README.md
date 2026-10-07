@@ -19,8 +19,14 @@
 - 失败场景定位**首个相关源片段**（行列 + 代码片段指示）并给出
   **稳定证据码**（对同一模块两次复核一致），同时清除旧结论：
   规则无匹配、重复变量长度不一致、未绑定 literal、递归超限（>64 层）、
-  语法不完整。
-- 递归超限**不阻塞后续合法模块复核**：每次 `review()` 使用全新状态。
+  **累计资源预算超限**（`expansion-budget`）、语法不完整。
+- **累计资源预算**（单次复核独立，可经环境变量配置）：
+  - `MACRO_REVIEW_MAX_EXPANSIONS`（默认 **2000**）：累计宏展开次数上限；
+  - `MACRO_REVIEW_MAX_OUTPUT_CHARS`（默认 **200000**）：累计展开输出字符上限。
+  复制型模板即便嵌套仅 16 层（远未触及 64 层单路径深度限制）也会产生
+  2¹⁶−1 次展开；预算耗尽时在构造大量步骤证据前受控中止，错误关联
+  **原始调用位置**，不返回任何部分结论或步骤记录。
+- 递归/预算超限**不阻塞后续合法模块复核**：每次 `review()` 使用全新状态。
 
 ## 目录
 
@@ -30,7 +36,7 @@
 | `app/engine.py` | 卫生展开器：规则编译/匹配/模板实例化、词法解析、身份标注 |
 | `app/server.py` | 标准库 HTTP 服务：页面 + `POST /api/review` + `/health` |
 | `app/static/index.html` | 规程复核页面（无框架、无构建步骤） |
-| `tests/test_engine.py` | 19 项卫生/literal/重复/错误/隔离/限额代码测试 |
+| `tests/test_engine.py` | 29 项卫生/literal/重复/错误/隔离/限额/累计预算代码测试 |
 | `verify.py` | **一次性验收服务**：代码测试 + 页面构建 + API/HTTP 冒烟，按退出码报告 |
 | `Dockerfile`, `docker-compose.yml` | 容器化与 Compose 编排 |
 
@@ -72,6 +78,17 @@ POST /api/review        <- {"source": "(define-syntax …) …"}
 `/api/review` 始终返回 200 与结构化 JSON：
 
 - 成功：`ok:true`、`steps[]`（命中规则与调用位置）、`normalized`、
-  `identities[]`、`hygieneChecks[]`；
-- 失败：`ok:false`、`error{kind,message,line,column,snippet,evidence}`，
+  `identities[]`、`hygieneChecks[]`，并附 `expansions`/`outputChars`/`budget`；
+- 失败：`ok:false`、`error{kind,message,line,column,snippet,evidence}`
+  （预算错误另附 `budget`/`limit`/`used`），
   且 `steps`/`normalized` 为空（旧结论清除）。
+
+## 资源预算配置
+
+| 环境变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `MACRO_REVIEW_MAX_EXPANSIONS` | 2000 | 单次复核累计宏展开次数 |
+| `MACRO_REVIEW_MAX_OUTPUT_CHARS` | 200000 | 单次复核累计展开输出字符 |
+
+单条嵌套路径的 64 层深度限制仍然保留，但它只约束单路径递归；
+真正限制复制型模板总体资源占用的是上述累计预算。

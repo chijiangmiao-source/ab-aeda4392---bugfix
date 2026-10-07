@@ -3,11 +3,23 @@
 Run:  python -m unittest discover -s tests -v
 """
 
+import re
 import unittest
 
 from app.engine import (
-    EXPANSION_LIMIT, MAX_MACROS, MAX_RULES, review,
+    EXPANSION_LIMIT, MAX_EXPANSIONS, MAX_MACROS, MAX_OUTPUT_CHARS, MAX_RULES, review,
 )
+
+
+def dup_module(levels: int) -> str:
+    """One macro, one rule whose template duplicates its argument; the
+    innermost call is a constant.  ``levels`` nested uses produce 2**levels-1
+    macro invocations while the nesting path is only ``levels`` deep."""
+    call = "1"
+    for _ in range(levels):
+        call = f"(dup {call})"
+    return ("(define-syntax dup (syntax-rules () ((dup e) (list e e))))\n"
+            + call + "\n")
 
 
 def norm(src):
@@ -241,6 +253,117 @@ class LimitsTests(unittest.TestCase):
         r = review(f"(define-syntax f (syntax-rules () {rules})) (f 1)")
         self.assertFalse(r.ok)
         self.assertEqual(r.error["kind"], "incomplete-syntax")
+
+
+class ExpansionBudgetTests(unittest.TestCase):
+    """Cumulative (not single-path-depth) resource boundaries.
+
+    A single macro with one duplicating rule, nested 16 levels, stays far
+    below the 64-level depth limit yet would otherwise perform 65,535
+    expansions and render 800k+ characters.
+    """
+
+    def test_16_level_duplicating_macro_fails_within_budget(self):
+        r = review(dup_module(16))
+        # controlled failure, never a success with a giant payload
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error["kind"], "expansion-budget")
+        # no partial conclusions and no tens-of-thousands of step records
+        self.assertEqual(r.steps, [])
+        self.assertEqual(r.normalized, "")
+        self.assertEqual(r.identities, [])
+        self.assertEqual(r.hygiene_checks, [])
+        # stopped well before the pathological size (65,535 steps / ~850k chars)
+        self.assertLessEqual(r.expansions, MAX_EXPANSIONS + 1)
+        self.assertLessEqual(r.expansions, 5000)
+        self.assertLessEqual(r.output_chars, MAX_OUTPUT_CHARS + 10000)
+        self.assertLess(r.output_chars, 100000)
+
+    def test_budget_error_locates_original_call_site(self):
+        r = review(dup_module(16))
+        # the outer user-written call lives on line 2; template-generated
+        # inner uses must not be reported as the origin
+        self.assertEqual(r.error["line"], 2)
+        self.assertEqual(r.error["column"], 1)
+        self.assertIn("(dup (dup", r.error["snippet"])
+        self.assertTrue(r.error["span"])
+
+    def test_budget_evidence_is_stable(self):
+        a = review(dup_module(16))
+        b = review(dup_module(16))
+        self.assertTrue(a.error["evidence"].startswith("EV-"))
+        self.assertEqual(a.error["evidence"], b.error["evidence"])
+
+    def test_budget_error_carries_usage_detail(self):
+        r = review(dup_module(16))
+        self.assertEqual(r.error["budget"], "expansions")
+        self.assertEqual(r.error["limit"], MAX_EXPANSIONS)
+        self.assertGreaterEqual(r.error["used"], 1)
+
+    def test_normal_nested_dup_macro_still_expands(self):
+        # 10 levels => 1,023 expansions, within the cumulative budget
+        r = review(dup_module(10))
+        self.assertTrue(r.ok, r.error)
+        self.assertEqual(len(r.steps), 1023)
+        # 1,024 leaf constants (identity tags such as ⁽F1⁾ must not be counted)
+        leaves = re.findall(r"(?<![\w⁽])1(?![\w⁾])", r.normalized)
+        self.assertEqual(len(leaves), 1024)
+
+    def test_normal_named_macro_scenario_still_expands(self):
+        src = """
+        (define-syntax with-x
+          (syntax-rules ()
+            ((with-x body) (let ((x 99)) body))))
+        (define-syntax call-with-x
+          (syntax-rules ()
+            ((call-with-x v) (with-x v))))
+        (let ((x 1)) (call-with-x x))
+        """
+        r = review(src)
+        self.assertTrue(r.ok, r.error)
+        self.assertEqual(len(r.steps), 2)
+        self.assertIn("(let ((x⁽B2⁾ 99)) x⁽B1⁾)", r.normalized)
+
+    def test_budget_failure_does_not_block_later_review(self):
+        review(dup_module(16))  # must not leave any global state
+        r2 = review("(define-syntax z (syntax-rules () ((z) 1))) (z)")
+        self.assertTrue(r2.ok, r2.error)
+        self.assertIn("1", r2.normalized)
+        r3 = review(dup_module(5))
+        self.assertTrue(r3.ok, r3.error)
+        self.assertEqual(len(r3.steps), 31)
+
+    def test_configurable_expansion_budget(self):
+        tight = review(dup_module(16), max_expansions=10)
+        self.assertFalse(tight.ok)
+        self.assertEqual(tight.error["kind"], "expansion-budget")
+        self.assertEqual(tight.error["limit"], 10)
+        self.assertLessEqual(tight.error["used"], 11)
+        # raising both budgets lets the full 16-level tree complete
+        wide = review(dup_module(16), max_expansions=100_000,
+                      max_output_chars=10_000_000)
+        self.assertTrue(wide.ok, wide.error)
+        self.assertEqual(len(wide.steps), 65_535)
+
+    def test_output_size_budget_independent_of_expansion_count(self):
+        # few expansions are allowed, but output must not balloon
+        r = review(dup_module(8), max_expansions=10 ** 9, max_output_chars=50)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error["kind"], "expansion-budget")
+        self.assertEqual(r.error["budget"], "output-chars")
+        self.assertEqual(r.steps, [])
+
+    def test_single_path_depth_limit_still_enforced(self):
+        # linear (non-duplicating) recursion must still hit the depth limit,
+        # which remains a separate defence from the cumulative budget
+        src = """
+        (define-syntax loop (syntax-rules () ((loop) (loop))))
+        (loop)
+        """
+        r = review(src, max_expansions=10 ** 9, max_output_chars=10 ** 9)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error["kind"], "recursion-limit")
+        self.assertIn(str(EXPANSION_LIMIT), r.error["message"])
 
 
 if __name__ == "__main__":

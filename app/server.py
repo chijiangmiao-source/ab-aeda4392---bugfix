@@ -14,7 +14,9 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .engine import MAX_MACROS, MAX_RULES, ReviewResult, review
+from .engine import (
+    MAX_EXPANSIONS, MAX_MACROS, MAX_OUTPUT_CHARS, MAX_RULES, ReviewResult, review,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE = os.path.join(HERE, "static", "index.html")
@@ -62,6 +64,10 @@ def result_to_dict(r: ReviewResult) -> dict:
         "normalized": r.normalized,
         "identities": r.identities,
         "hygieneChecks": r.hygiene_checks,
+        "expansions": r.expansions,
+        "outputChars": r.output_chars,
+        "budget": {"maxExpansions": MAX_EXPANSIONS,
+                   "maxOutputChars": MAX_OUTPUT_CHARS},
     }
 
 
@@ -114,6 +120,9 @@ class Handler(BaseHTTPRequestHandler):
                           "snippet": "", "span": None},
                 "steps": [], "normalized": "", "identities": [],
                 "hygieneChecks": [], "macroCount": 0,
+                "expansions": 0, "outputChars": 0,
+                "budget": {"maxExpansions": MAX_EXPANSIONS,
+                           "maxOutputChars": MAX_OUTPUT_CHARS},
             })
 
     def _do_post(self):
@@ -142,7 +151,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "macroCount": 0, "steps": [],
                                   "normalized": "", "identities": [],
                                   "hygieneChecks": [],
-                                  "error": None})
+                                  "error": None,
+                                  "expansions": 0, "outputChars": 0,
+                                  "budget": {"maxExpansions": MAX_EXPANSIONS,
+                                             "maxOutputChars": MAX_OUTPUT_CHARS}})
             return
         r = review(source)
         self._send_json(200, result_to_dict(r))
