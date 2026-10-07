@@ -176,8 +176,49 @@ def smoke(base: str) -> bool:
         "recursion-limit")
     check("递归超限报错且不阻塞", d["error"]["kind"] == "recursion-limit")
 
+    # --- cumulative expansion budget: 16-level duplicating template --------
+    # One macro, one rule that copies its argument twice; nested 16 levels it
+    # fans out exponentially while staying under the single-chain depth limit
+    # and the request-body/module/rule limits.  The review must stop at the
+    # cumulative budget with a controlled, located failure — not succeed with
+    # tens of thousands of step records.
+    dup_expr = "1"
+    for _ in range(16):
+        dup_expr = f"(dup {dup_expr})"
+    dup_src = ("(define-syntax dup (syntax-rules () ((dup e) (pair e e))))\n"
+               + dup_expr)
+    d = expect_error(dup_src, "expansion-budget")
+    check("16 层复制型宏触发累计展开预算错误",
+          (not d["ok"] and d["error"]["kind"] == "expansion-budget"),
+          d.get("error", {}).get("kind", ""))
+    check("预算错误定位原始（最外层）调用处",
+          d["error"]["line"] == 2 and d["error"]["column"] == 1
+          and d["error"]["snippet"].lstrip().startswith("(dup"),
+          f"第 {d['error']['line']} 行 第 {d['error']['column']} 列")
+    check("预算失败不返回任何步骤记录/规范化结论",
+          d["steps"] == [] and d["normalized"] == ""
+          and d["identities"] == [] and d["hygieneChecks"] == [],
+          f"{len(d['steps'])} 步, {len(d['normalized'])} 字符")
+    check("预算错误给出稳定证据", d["error"]["evidence"].startswith("EV-"),
+          d["error"]["evidence"])
+    d_again = expect_error(dup_src, "expansion-budget")
+    check("预算错误证据两次复核一致",
+          d_again["error"]["evidence"] == d["error"]["evidence"])
+
     d2 = expect_error("(define-syntax z (syntax-rules () ((z) 1)))\n(z)", "ok")
-    check("递归超限后后续合法模块仍可复核（状态隔离）", d2["ok"] and d2["normalized"])
+    check("预算失败后后续合法模块仍可复核（状态隔离）", d2["ok"] and d2["normalized"])
+
+    # normal (non-duplicating) nested macro still completes
+    wrap_expr = "1"
+    for _ in range(16):
+        wrap_expr = f"(wrap {wrap_expr})"
+    wrap_src = ("(define-syntax wrap (syntax-rules () ((wrap e) (pair e))))\n"
+                + wrap_expr)
+    _, wb = http("POST", f"{base}/api/review", {"source": wrap_src})
+    wd = json.loads(wb)
+    check("正常 16 层非复制嵌套宏仍可完成审查",
+          wd["ok"] and len(wd["steps"]) == 16 and "1" in wd["normalized"],
+          f"{len(wd.get('steps', []))} 步")
 
     d = expect_error("(define-syntax x (syntax-rules () ((x a) a))\n(x 1)",
                      "incomplete-syntax")

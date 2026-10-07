@@ -6,7 +6,8 @@ Run:  python -m unittest discover -s tests -v
 import unittest
 
 from app.engine import (
-    EXPANSION_LIMIT, MAX_MACROS, MAX_RULES, review,
+    EXPANSION_LIMIT, MAX_EXPANSION_OUTPUT_NODES, MAX_EXPANSION_STEPS,
+    MAX_MACROS, MAX_RULES, review,
 )
 
 
@@ -241,6 +242,80 @@ class LimitsTests(unittest.TestCase):
         r = review(f"(define-syntax f (syntax-rules () {rules})) (f 1)")
         self.assertFalse(r.ok)
         self.assertEqual(r.error["kind"], "incomplete-syntax")
+
+
+def _duplicating_module(depth: int) -> str:
+    """One macro, one rule, template copies its argument: exponential fan-out."""
+    expr = "1"
+    for _ in range(depth):
+        expr = f"(dup {expr})"
+    return ("(define-syntax dup (syntax-rules () ((dup e) (pair e e))))\n"
+            + expr + "\n")
+
+
+class ExpansionBudgetTests(unittest.TestCase):
+    def test_budgets_are_below_the_pathological_scale(self):
+        # The reported abuse produced >60_000 steps and >800_000 normalized
+        # chars; the configured cumulative boundary must stop well before it.
+        self.assertLess(MAX_EXPANSION_STEPS, 60_000)
+        self.assertLess(MAX_EXPANSION_OUTPUT_NODES, 800_000)
+
+    def test_16_level_duplicating_macro_fails_before_abnormal_size(self):
+        src = _duplicating_module(16)
+        self.assertLess(len(src), 256 * 1024)  # still inside the request limit
+        r = review(src)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error["kind"], "expansion-budget")
+        # depth 16 is far below the single-chain limit, so this must be the
+        # *cumulative* boundary firing, not the recursion-depth guard
+        self.assertNotIn(str(EXPANSION_LIMIT), r.error["message"])
+        # located at the original (outermost) call site: line 2, column 1
+        self.assertEqual((r.error["line"], r.error["column"]), (2, 1))
+        self.assertTrue(r.error["snippet"].lstrip().startswith("(dup"))
+        self.assertIsNotNone(r.error["span"])
+        self.assertTrue(r.error["evidence"].startswith("EV-"))
+        # controlled failure carries no partial success conclusion at all
+        self.assertEqual(r.steps, [])
+        self.assertEqual(r.normalized, "")
+        self.assertEqual(r.identities, [])
+        self.assertEqual(r.hygiene_checks, [])
+
+    def test_budget_evidence_is_stable_across_reviews(self):
+        src = _duplicating_module(16)
+        self.assertEqual(review(src).error["evidence"],
+                         review(src).error["evidence"])
+
+    def test_budget_failure_does_not_block_later_legitimate_review(self):
+        review(_duplicating_module(16))  # exhausts a review-scoped budget
+        good = review("(define-syntax z (syntax-rules () ((z) 1))) (z)")
+        self.assertTrue(good.ok, good.error)
+        self.assertIn("1", good.normalized)
+        self.assertEqual(len(good.steps), 1)
+
+    def test_normal_deep_nesting_without_duplication_still_completes(self):
+        # Single (non-duplicating) copy per level: 16 nested levels are fine.
+        expr = "1"
+        for _ in range(16):
+            expr = f"(wrap {expr})"
+        src = ("(define-syntax wrap (syntax-rules () ((wrap e) (pair e))))\n"
+               + expr)
+        r = review(src)
+        self.assertTrue(r.ok, r.error)
+        self.assertEqual(len(r.steps), 16)
+        self.assertIn("1", r.normalized)
+
+    def test_single_ellipsis_rule_cannot_spike_past_budget(self):
+        # One rule with a long one-level repetition could otherwise emit a huge
+        # output in a single invocation; the budget is reserved pre-build.
+        args = " ".join("1" for _ in range(100_000))
+        src = ("(define-syntax big (syntax-rules () "
+               "((big e ...) (list e ...))))\n(big " + args + ")\n")
+        r = review(src)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error["kind"], "expansion-budget")
+        self.assertEqual(r.error["line"], 2)
+        self.assertEqual(r.steps, [])
+        self.assertEqual(r.normalized, "")
 
 
 if __name__ == "__main__":

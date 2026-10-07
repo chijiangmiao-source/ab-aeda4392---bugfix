@@ -21,6 +21,7 @@ recursion-limit failure) cannot contaminate a later module.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from hashlib import sha1
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -29,7 +30,26 @@ from .syntax import Cell, Form, GLOBAL_SCOPE, Sym, SyntaxError_, get_span
 
 MAX_MACROS = 12
 MAX_RULES = 8
+# Depth along a single nesting chain.  This bounds recursion but *not* total
+# work: a duplicating template fans out exponentially while staying well below
+# this depth, so cumulative budgets below are the real resource boundary.
 EXPANSION_LIMIT = 64
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Cumulative per-review resource budgets (override via environment for
+# deployment-specific sizing).  They cap total macro invocations and the
+# cumulative number of produced syntax nodes across all invocations, so a
+# finite-depth duplicating template cannot return tens of thousands of step
+# records / a huge normalized form from a single compact request.
+MAX_EXPANSION_STEPS = _int_env("MACRO_REVIEW_MAX_STEPS", 10_000)
+MAX_EXPANSION_OUTPUT_NODES = _int_env("MACRO_REVIEW_MAX_OUTPUT_NODES", 100_000)
 
 CORE_FORMS = {"lambda", "let", "quote", "quasiquote", "define-syntax", "syntax-rules",
               "if", "cond", "begin", "and", "or", "else", "=>"}
@@ -77,6 +97,47 @@ class ScopeSupply:
         s = self.fresh()
         self.intro_scopes.add(s)
         return s
+
+
+class Budget:
+    """Cumulative resource budget for a single review.
+
+    Unlike :data:`EXPANSION_LIMIT` (which only bounds the depth of one nesting
+    chain), this bounds the *total* work a request can do: the number of macro
+    invocations and the cumulative size of their instantiated outputs.  A
+    finite-depth template that duplicates its argument exhausts this budget
+    long before its exponential output can be built or serialized.
+    """
+
+    def __init__(self, max_steps: int = MAX_EXPANSION_STEPS,
+                 max_output_nodes: int = MAX_EXPANSION_OUTPUT_NODES) -> None:
+        self.max_steps = max_steps
+        self.max_output_nodes = max_output_nodes
+        self.steps = 0
+        self.output_nodes = 0
+
+    def charge_step(self, span: Optional[Tuple[int, int]] = None) -> None:
+        self.steps += 1
+        if self.steps > self.max_steps:
+            raise MacroError(
+                "expansion-budget",
+                f"累计宏展开次数达到预算上限 {self.max_steps} 次，"
+                "疑似复制型模板放大，请拆分模块或简化嵌套调用", span)
+
+    def precheck_output(self, node_count: int,
+                        span: Optional[Tuple[int, int]] = None) -> None:
+        """Reserve output capacity *before* building a (possibly huge) form."""
+        if self.output_nodes + node_count > self.max_output_nodes:
+            raise MacroError(
+                "expansion-budget",
+                f"累计展开产物达到预算上限 {self.max_output_nodes} 个节点"
+                f"（本次将再产生 {node_count} 个），疑似复制型模板放大，"
+                "请拆分模块或简化嵌套调用", span)
+
+    def charge_output(self, node_count: int,
+                      span: Optional[Tuple[int, int]] = None) -> None:
+        self.precheck_output(node_count, span)
+        self.output_nodes += node_count
 
 
 def add_scope(form: Form, scope: int) -> Form:
@@ -347,6 +408,60 @@ def _is_replist(v: Any) -> bool:
     return type(v) is list
 
 
+def _form_size(f: Form) -> int:
+    """Number of syntax nodes (cells + atoms) in an instantiated form."""
+    if isinstance(f, Cell):
+        return 1 + sum(_form_size(x) for x in f)
+    return 1
+
+
+def _rep_lengths(node: Any, binds: Dict[str, Form]):
+    """Validate repeated-variable lengths exactly as instantiation does.
+
+    Returns ``(count, rep_vars)``.  Raises ``repetition-mismatch`` with the
+    same span/message as :func:`instantiate` so a pre-build budget check never
+    changes user-facing error semantics.
+    """
+    coded: List[Any] = node[1]
+    rep_tmpl_cell: Cell = node[2][1]
+    idx = node[2][0]
+    rep_vars = _subs_under(coded[idx])
+    lengths = {len(binds[n]) for n in rep_vars if _is_replist(binds.get(n))}
+    if len(lengths) > 1:
+        detail = ", ".join(f"{n}={len(binds[n])}"
+                           for n in sorted(rep_vars) if _is_replist(binds.get(n)))
+        raise MacroError("repetition-mismatch",
+                         f"重复变量长度不一致（{detail}），模板片段要求等长",
+                         rep_tmpl_cell.span)
+    return (next(iter(lengths)) if lengths else 0), rep_vars
+
+
+def instantiated_size(node: Any, binds: Dict[str, Form],
+                      frame: Optional[int] = None) -> int:
+    """Exact node count of the form :func:`instantiate` would produce.
+
+    Computed without constructing it, so the output budget can be reserved
+    before a large expansion allocates anything.
+    """
+    kind = node[0]
+    if kind == "sub":
+        v = binds[node[1]]
+        if _is_replist(v):
+            return _form_size(v[frame]) if frame is not None else 0
+        return _form_size(v)
+    if kind in ("intro", "const"):
+        return _form_size(node[1])
+    coded: List[Any] = node[1]
+    if node[2] is None:
+        return 1 + sum(instantiated_size(c, binds, frame) for c in coded)
+    idx = node[2][0]
+    count, _ = _rep_lengths(node, binds)
+    total = 1 + sum(instantiated_size(c, binds, frame) for c in coded[:idx])
+    total += sum(instantiated_size(coded[idx], binds, i) for i in range(count))
+    total += sum(instantiated_size(c, binds, frame) for c in coded[idx + 1:])
+    return total
+
+
 def instantiate(node: Any, binds: Dict[str, Form], rep_cell: Optional[Cell] = None,
                 frame: Optional[int] = None) -> Form:
     kind = node[0]
@@ -368,19 +483,10 @@ def instantiate(node: Any, binds: Dict[str, Form], rep_cell: Optional[Cell] = No
     if rep is None:
         return Cell([instantiate(c, binds, None, frame) for c in coded], span=span)
     idx, rep_tmpl_cell = rep
-    rep_node = coded[idx]
-    rep_vars = _subs_under(rep_node)
-    lengths = {len(binds[n]) for n in rep_vars if _is_replist(binds.get(n))}
-    if len(lengths) > 1:
-        detail = ", ".join(f"{n}={len(binds[n])}"
-                           for n in sorted(rep_vars) if _is_replist(binds.get(n)))
-        raise MacroError("repetition-mismatch",
-                         f"重复变量长度不一致（{detail}），模板片段要求等长",
-                         rep_tmpl_cell.span)
-    count = next(iter(lengths)) if lengths else 0
+    count, _ = _rep_lengths(node, binds)
     out: List[Form] = [instantiate(c, binds, None, frame) for c in coded[:idx]]
     for i in range(count):
-        out.append(instantiate(rep_node, binds, rep_tmpl_cell, i))
+        out.append(instantiate(coded[idx], binds, rep_tmpl_cell, i))
     out.extend(instantiate(c, binds, None, frame) for c in coded[idx + 1:])
     return Cell(out, span=span)
 
@@ -461,8 +567,8 @@ def review(src: str) -> ReviewResult:
         res.macro_count = len(macros)
 
         env: Env = []
-        step_counter = [0]
-        expanded = [_expand(f, env, 1, macros, scopes, res, step_counter, src)
+        budget = Budget()
+        expanded = [_expand(f, env, 1, macros, scopes, res, budget, src)
                     for f in bodies]
 
         norm, identities, checks = _annotate(expanded, scopes.intro_scopes, src)
@@ -472,12 +578,23 @@ def review(src: str) -> ReviewResult:
         res.ok = True
         return res
     except MacroError as e:
-        res.error = _error_payload(e.kind, e.message, e.span, e.evidence, src)
+        # Controlled failure: never retain partial conclusions (no half-built
+        # step list, normalized text or identities from the failed attempt).
+        _fail(res, _error_payload(e.kind, e.message, e.span, e.evidence, src))
         return res
     except SyntaxError_ as e:
         ev = _evidence("incomplete-syntax", e.message, e.span)
-        res.error = _error_payload("incomplete-syntax", e.message, e.span, ev, src)
+        _fail(res, _error_payload("incomplete-syntax", e.message, e.span, ev, src))
         return res
+
+
+def _fail(res: ReviewResult, error: Dict[str, Any]) -> None:
+    res.ok = False
+    res.error = error
+    res.steps = []
+    res.normalized = ""
+    res.identities = []
+    res.hygiene_checks = []
 
 
 # --------------------------------------------------------------------------- #
@@ -559,7 +676,7 @@ def _compile_macro(f: Cell, macros: Dict[str, Macro], scopes: ScopeSupply) -> No
 # --------------------------------------------------------------------------- #
 
 def _expand(form: Form, env: Env, depth: int, macros: Dict[str, Macro],
-            scopes: ScopeSupply, res: ReviewResult, step_counter: List[int],
+            scopes: ScopeSupply, res: ReviewResult, budget: "Budget",
             src: str, root_span: Optional[Tuple[int, int]] = None) -> Form:
     if not isinstance(form, Cell) or not form:
         return form
@@ -568,14 +685,14 @@ def _expand(form: Form, env: Env, depth: int, macros: Dict[str, Macro],
         if head.name in ("quote", "quasiquote"):
             return form
         if head.name == "lambda" and resolve_binding(head, env) == ("global", "lambda"):
-            return _expand_lambda(form, env, depth, macros, scopes, res, step_counter, src)
+            return _expand_lambda(form, env, depth, macros, scopes, res, budget, src)
         if head.name == "let" and resolve_binding(head, env) == ("global", "let"):
-            return _expand_let(form, env, depth, macros, scopes, res, step_counter, src)
+            return _expand_let(form, env, depth, macros, scopes, res, budget, src)
         rb = resolve_binding(head, env)
         if rb[0] == "global" and rb[1] in macros:
-            return _expand_macro(form, env, depth, macros, scopes, res, step_counter, src,
+            return _expand_macro(form, env, depth, macros, scopes, res, budget, src,
                                  root_span)
-    return Cell([_expand(x, env, depth, macros, scopes, res, step_counter, src, root_span)
+    return Cell([_expand(x, env, depth, macros, scopes, res, budget, src, root_span)
                  for x in form], span=form.span)
 
 
@@ -590,7 +707,7 @@ def _check_params(params: Form) -> List[Sym]:
     return out
 
 
-def _expand_lambda(form: Cell, env: Env, depth, macros, scopes, res, step_counter, src,
+def _expand_lambda(form: Cell, env: Env, depth, macros, scopes, res, budget, src,
                    root_span=None):
     if len(form) < 3:
         raise MacroError("incomplete-syntax",
@@ -602,13 +719,13 @@ def _expand_lambda(form: Cell, env: Env, depth, macros, scopes, res, step_counte
         raise MacroError("incomplete-syntax", "lambda 参数名重复", form[1].span)
     new_env = env + [(p.name, ps.scopes, object()) for p, ps in zip(params, new_params)]
     bodies = [add_scope(b, scope) for b in form[2:]]
-    bodies = [_expand(b, new_env, depth, macros, scopes, res, step_counter, src, root_span)
+    bodies = [_expand(b, new_env, depth, macros, scopes, res, budget, src, root_span)
               for b in bodies]
     return Cell([Sym("lambda", form[0].scopes, form[0].span),
                  Cell(new_params, span=form[1].span)] + bodies, span=form.span)
 
 
-def _expand_let(form: Cell, env: Env, depth, macros, scopes, res, step_counter, src,
+def _expand_let(form: Cell, env: Env, depth, macros, scopes, res, budget, src,
                 root_span=None):
     if len(form) < 3 or not isinstance(form[1], Cell):
         raise MacroError("incomplete-syntax",
@@ -621,7 +738,7 @@ def _expand_let(form: Cell, env: Env, depth, macros, scopes, res, step_counter, 
             raise MacroError("incomplete-syntax",
                              "let 绑定必须是 (<名称> <表达式>)", get_span(pair))
         binders.append(pair[0])
-        ival = _expand(pair[1], env, depth, macros, scopes, res, step_counter, src,
+        ival = _expand(pair[1], env, depth, macros, scopes, res, budget, src,
                        root_span)
         new_pairs.append(Cell([pair[0], ival], span=pair.span))
     scope = scopes.fresh()
@@ -631,19 +748,23 @@ def _expand_let(form: Cell, env: Env, depth, macros, scopes, res, step_counter, 
     new_env = env + [(b.name, bs.scopes, object()) for b, bs in zip(binders, new_binders)]
     final_pairs = [Cell([bs, p[1]], span=p.span) for bs, p in zip(new_binders, new_pairs)]
     bodies = [add_scope(b, scope) for b in form[2:]]
-    bodies = [_expand(b, new_env, depth, macros, scopes, res, step_counter, src, root_span)
+    bodies = [_expand(b, new_env, depth, macros, scopes, res, budget, src, root_span)
               for b in bodies]
     return Cell([Sym("let", form[0].scopes, form[0].span),
                  Cell(final_pairs, span=bind_cell.span)] + bodies, span=form.span)
 
 
 def _expand_macro(form: Cell, env: Env, depth, macros: Dict[str, Macro],
-                  scopes: ScopeSupply, res: ReviewResult, step_counter, src: str,
+                  scopes: ScopeSupply, res: ReviewResult, budget: "Budget", src: str,
                   root_span: Optional[Tuple[int, int]] = None) -> Form:
     root = root_span or form.span
     if depth > EXPANSION_LIMIT:
         raise MacroError("recursion-limit",
                          f"宏展开递归深度超过 {EXPANSION_LIMIT} 层，疑似无限递归", root)
+    # Cumulative boundary (not just single-chain depth): reserve this
+    # invocation against the budget before doing its work.  A budget failure
+    # is anchored at the original top-level call via ``root``.
+    budget.charge_step(root)
     macro = macros[form[0].name]
     use = scopes.fresh()
     marked = add_scope(form, use)
@@ -662,18 +783,21 @@ def _expand_macro(form: Cell, env: Env, depth, macros: Dict[str, Macro],
         raise MacroError("no-rule-match",
                          f"宏 '{macro.name}' 的 {len(macro.rules)} 条规则均不匹配该调用",
                          form.span)
+    # Reserve output capacity before constructing it, so one rule with a long
+    # ellipsis repetition cannot spike past the budget in a single step.
+    out_size = instantiated_size(chosen.tcode, binds)
+    budget.charge_output(out_size, root)
     output = instantiate(chosen.tcode, binds)
     output = remove_scope(output, use)
     if not isinstance(output, Cell):
         output = Cell([output])
 
-    step_counter[0] += 1
     line, col, _ = locate(src, form.span)
     after_text, origins = _render_origin(output, macro.intro)
     call_origin = ("macro-template" if form[0].scopes & scopes.intro_scopes
                    else "call-site")
     res.steps.append(Step(
-        step_id=f"ST-{step_counter[0]:04d}",
+        step_id=f"ST-{budget.steps:04d}",
         macro=macro.name,
         rule_index=chosen.index + 1,
         rule_pattern=_render_plain(chosen.pattern),
@@ -688,7 +812,7 @@ def _expand_macro(form: Cell, env: Env, depth, macros: Dict[str, Macro],
         after=after_text,
         origins=origins,
     ))
-    return _expand(output, env, depth + 1, macros, scopes, res, step_counter, src, root)
+    return _expand(output, env, depth + 1, macros, scopes, res, budget, src, root)
 
 
 # --------------------------------------------------------------------------- #
